@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AstroStation 天文盒子文件浏览器 (v3 · 自动连接版)
+"""AstroStation 天文盒子文件浏览器 (v1.0.1)
 ================================================
 连接树莓派天文盒子 (as / astrostation / 共享 AstroStation)。自动发现盒子地址:
   ① 上次成功的地址 -> ② 10.0.10.1 (盒子 WiFi 热点) -> ③ mDNS 搜索 raspberrypi.local (网线直连)
@@ -8,15 +8,21 @@
   - 下载: 选中项(文件或文件夹, 递归)下载到本地任意位置
   - 批量下载: 多条 "远程目录 -> 本地目录" 映射任务, 一键后台执行
   - 后台任务队列面板: 逐任务进度条 / 取消 / 重试 / 状态汇总
+  - CLI: 命令行模式 (discover / ls / stat / dl), 供自动化(脚本 / windows-mcp)直接调用
+  - 连接设置: 界面「设置」按钮可改 地址 / 账号 / 密码 / 共享名 (默认 = 图谱盒子出厂值)
+  - 无头自检: --selftest (发现+连接+列目录, 并写 selftest_result.txt)
 
-用法:  python stellavita_browser.py
+用法:
+  python stellavita_browser.py                 # 图形界面
+  python stellavita_browser.py --selftest      # 无头自检
+  python stellavita_browser.py --cli dl <远程路径> <本地路径> [--jobs 8]
 依赖:  pip install impacket customtkinter
 
 SMB 协议逻辑与旧版一致(保持不变):
   SMBConnection(host, host, timeout=10) / login / connectTree
   / listPath(share, pattern, 3) / getFile(share, path, callback)
 """
-import os, json, time, threading, itertools, socket, struct
+import os, json, time, threading, itertools, socket, struct, sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import customtkinter as ctk
@@ -32,11 +38,22 @@ USER = 'as'
 PASS = 'astrostation'
 SHARE = 'AstroStation'
 DIR_ATTR = 0x10
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'astrostation_config.json')
+def _app_base_dir():
+    """数据基准目录: 打包(frozen)后=exe 所在目录; 脚本运行=脚本所在目录。
+    (修复: PyInstaller onefile 下 __file__ 在临时解压目录, 配置/记忆会随退出丢失)"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+VERSION = 'v1.0.1'
+CONFIG_PATH = os.path.join(_app_base_dir(), 'astrostation_config.json')
 SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 PHASE_STAT = '统计中…'
 PHASE_DL = '下载中'
 PARALLEL_DEFAULT = 8  # 默认并行连接数(下载面板可调)
+
+# 连接参数(界面「设置」/ 配置文件可改; 默认 = 图谱盒子出厂值)
+CREDS = {'user': USER, 'pass': PASS, 'share': SHARE}
 
 # ---------------- 配色(暗色现代) ----------------
 C = {
@@ -202,16 +219,41 @@ class AppConfig:
         except Exception:
             pass
 
+
+def _load_creds(cfg):
+    """从配置读取连接参数(账号/密码/共享名)到 CREDS; 界面/CLI/自检共用。"""
+    for key, dflt in (('user', USER), ('pass', PASS), ('share', SHARE)):
+        try:
+            v = cfg.get(key, dflt)
+        except Exception:
+            v = dflt
+        if v:
+            CREDS[key] = str(v)
+
+
+def apply_settings(cfg, host=None, user=None, password=None, share=None):
+    """写入连接设置并落盘。host=None 不改地址; host='' 清空固定地址(纯自动发现)。"""
+    if host is not None:
+        cfg.set('last_host', str(host or '').strip())
+    if user is not None and str(user).strip():
+        cfg.set('user', str(user).strip())
+    if password is not None:
+        cfg.set('pass', str(password))
+    if share is not None and str(share).strip():
+        cfg.set('share', str(share).strip())
+    cfg.save()
+    _load_creds(cfg)
+
 # ---------------- SMB 服务层(协议用法与旧版一致) ----------------
 class SMBService:
     """封装 impacket SMB 连接 / 列目录 / 递归遍历 / 下载。
     注意: impacket 连接对象非线程安全, 所有 SMB 调用用锁串行化。"""
 
-    def __init__(self, host=HOST, user=USER, password=PASS, share=SHARE):
-        self.host = host
-        self.user = user
-        self.password = password
-        self.share = share
+    def __init__(self, host=HOST, user=None, password=None, share=None):
+        self.host = host or HOST
+        self.user = user if user is not None else CREDS['user']
+        self.password = password if password is not None else CREDS['pass']
+        self.share = share if share is not None else CREDS['share']
         self._conn = None
         self._lock = threading.RLock()
 
@@ -344,14 +386,17 @@ def _parse_mdns_a(data):
 
 
 def _mdns_find(timeout=1.8):
-    """mDNS 查询 raspberrypi.local, 返回候选 IP 列表 (网线直连场景盒子会应答)。"""
+    """mDNS 搜索: 主机名(raspberrypi.local) + SMB 服务(_smb._tcp.local), 返回候选 IP 列表。"""
     found = []
+    queries = []
     try:
-        q = struct.pack('>HHHHHH', 0, 0, 1, 0, 0, 0)
-        for part in 'raspberrypi.local'.split('.'):
-            b = part.encode()
-            q += bytes([len(b)]) + b
-        q += b'\x00' + struct.pack('>HH', 1, 1)
+        for name, qtype in (('raspberrypi.local', 1), ('_smb._tcp.local', 12)):
+            q = struct.pack('>HHHHHH', 0, 0, 1, 0, 0, 0)
+            for part in name.split('.'):
+                b = part.encode()
+                q += bytes([len(b)]) + b
+            q += b'\x00' + struct.pack('>HH', qtype, 1)
+            queries.append(q)
     except Exception:
         return found
     socks = []
@@ -369,7 +414,8 @@ def _mdns_find(timeout=1.8):
                 s.bind((src, 0))
             else:
                 s.bind(('', 0))
-            s.sendto(q, ('224.0.0.251', 5353))
+            for q in queries:
+                s.sendto(q, ('224.0.0.251', 5353))
             socks.append(s)
         except Exception:
             pass
@@ -381,7 +427,7 @@ def _mdns_find(timeout=1.8):
     except Exception:
         pass
     end = time.time() + timeout
-    while time.time() < end and len(found) < 6:
+    while time.time() < end and len(found) < 8:
         for s in socks:
             try:
                 s.settimeout(max(0.05, end - time.time()))
@@ -410,37 +456,120 @@ def _quick_445(ip, timeout=0.8):
         return False
 
 
-def discover_host(cfg=None, log=None):
-    """按 ①上次地址 ②10.0.10.1 ③mDNS 顺序找盒子, 返回第一个能登录的地址。"""
-    cands = []
-
-    def add(ip):
-        if ip and ip not in cands:
-            cands.append(ip)
-
-    if cfg is not None:
+def _nbns_find(timeout=1.5):
+    """NetBIOS 名字广播查询(备用发现通道): 找名为 RASPBERRYPI 的节点, 返回应答 IP 列表。"""
+    found = []
+    try:
+        raw = b'RASPBERRYPI'.ljust(15, b' ') + b'\x00'
+        enc = b''
+        for b in raw:
+            enc += bytes([0x41 + (b >> 4), 0x41 + (b & 0x0F)])
+        q = struct.pack('>HHHHHH', 0x4E42, 0x0110, 1, 0, 0, 0) + b'\x20' + enc + b'\x00'
+        q += struct.pack('>HH', 0x0020, 0x0001)
+    except Exception:
+        return found
+    socks = []
+    try:
+        srcs = [ip for ip in socket.gethostbyname_ex(socket.gethostname())[2]
+                if not ip.startswith('127.')]
+    except Exception:
+        srcs = []
+    for src in (srcs or ['']):
         try:
-            add(str(cfg.get('last_host', '') or '').strip())
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if src:
+                s.bind((src, 0))
+            else:
+                s.bind(('', 0))
+            for dst in ('169.254.255.255', '255.255.255.255'):
+                try:
+                    s.sendto(q, (dst, 137))
+                except Exception:
+                    pass
+            socks.append(s)
         except Exception:
             pass
-    add('10.0.10.1')
-    for ip in _mdns_find():
-        add(ip)
-    if log:
-        log('候选: ' + (', '.join(cands) or '无'))
-    for ip in cands[:10]:
-        if not _quick_445(ip):
-            if log:
-                log(f'{ip} 445 不通')
-            continue
+    end = time.time() + timeout
+    while time.time() < end and len(found) < 4:
+        for s in socks:
+            try:
+                s.settimeout(max(0.05, end - time.time()))
+                data, addr = s.recvfrom(2048)
+            except Exception:
+                continue
+            try:
+                flags = struct.unpack('>H', data[2:4])[0]
+                an = struct.unpack('>H', data[6:8])[0]
+            except Exception:
+                continue
+            if (flags & 0x8000) and an >= 1 and addr[0] not in found:
+                found.append(addr[0])
+    for s in socks:
         try:
-            svc = SMBService(host=ip)
-            svc.connect()
-            svc.close()
-            return ip
-        except Exception as e:
-            if log:
-                log(f'{ip} 登录失败: {str(e)[:80]}')
+            s.close()
+        except Exception:
+            pass
+    return found
+
+
+def discover_host(cfg=None, log=None):
+    """按 ①上次地址 ②10.0.10.1 ③mDNS ④NetBIOS 名字广播 顺序找盒子, 返回第一个能登录的地址。
+    惰性探测: 前面的候选找到就不再做后面的广播搜索。"""
+    seen = set()
+
+    def try_ip(ip):
+        if not ip or ip in seen:
+            return None
+        seen.add(ip)
+        for attempt in (1, 2):
+            if not _quick_445(ip):
+                # 盒子 445 偶发抖动: 稍等重试一次 (实测遇到过自愈)
+                if attempt == 1:
+                    time.sleep(0.3)
+                    continue
+                if log:
+                    log(f'{ip} 445 不通')
+                return None
+            try:
+                svc = SMBService(host=ip)
+                svc.connect()
+                svc.close()
+                return ip
+            except Exception as e:
+                if log:
+                    log(f'{ip} 登录失败: {str(e)[:80]}')
+                return None
+        return None
+
+    base = []
+    if cfg is not None:
+        try:
+            base.append(str(cfg.get('last_host', '') or '').strip())
+        except Exception:
+            pass
+    base.append('10.0.10.1')
+    if log:
+        log('候选: ' + (', '.join([b for b in base if b]) or '无'))
+    for ip in base:
+        got = try_ip(ip)
+        if got:
+            return got
+    extra = _mdns_find()
+    if extra and log:
+        log('mDNS: ' + ', '.join(extra))
+    for ip in extra:
+        got = try_ip(ip)
+        if got:
+            return got
+    extra = _nbns_find()
+    if extra and log:
+        log('NetBIOS: ' + ', '.join(extra))
+    for ip in extra:
+        got = try_ip(ip)
+        if got:
+            return got
     return None
 
 # ---------------- 下载任务 / 队列引擎 ----------------
@@ -470,6 +599,7 @@ class DownloadTask:
         self._last_emit = 0.0
         self._lock = threading.RLock()
         self._fails = []
+        self._last_err = ''
 
     @property
     def terminal(self):
@@ -567,6 +697,7 @@ class DownloadQueue:
     # ---- 展开(统计)线程 ----
     def _expand_loop(self):
         lister = None
+        lister_key = None
         while True:
             with self._cv:
                 while not self._stop and not self._expand_pending:
@@ -585,9 +716,19 @@ class DownloadQueue:
             if task is None:
                 continue
             try:
+                live = self._host_getter()
+                key = (live, CREDS['user'], CREDS['pass'], CREDS['share'])
+                if lister is not None and lister_key != key:
+                    # 盒子地址/账号变化后, 统计连接重建
+                    try:
+                        lister.close()
+                    except Exception:
+                        pass
+                    lister = None
                 if lister is None:
-                    lister = SMBService(host=self._host_getter())
+                    lister = SMBService(host=live)
                     lister.connect()
+                    lister_key = key
                 self._expand_task(lister, task)
             except TaskCancelled:
                 task.state = 'cancelled'
@@ -682,10 +823,22 @@ class DownloadQueue:
         if task._cancelled or task.terminal:
             self._count_file(task, ok=False)
             return
+        last_err = ''
         for attempt in (1, 2):
             try:
                 task.check()
                 os.makedirs(os.path.dirname(local) or '.', exist_ok=True)
+                live = self._host_getter()
+                if live and svc.host != live:
+                    # 修复: 盒子地址可能已重新发现(直连地址变化/热点切换), 跟随最新地址
+                    try:
+                        svc.close()
+                    except Exception:
+                        pass
+                    svc.host = live
+                svc.user = CREDS['user']
+                svc.password = CREDS['pass']
+                svc.share = CREDS['share']
                 if not svc.connected:
                     svc.connect()
                 svc.download_file(remote, local,
@@ -697,7 +850,8 @@ class DownloadQueue:
                 _rm_quiet(local)
                 self._count_file(task, ok=False)
                 return
-            except Exception:
+            except Exception as e:
+                last_err = '%s [目标 %s]' % (_short(e, 140), svc.host)
                 _rm_quiet(local)
                 try:
                     svc.close()
@@ -706,6 +860,7 @@ class DownloadQueue:
                 if attempt == 2:
                     with task._lock:
                         task._fails.append(basename_path(remote))
+                        task._last_err = last_err
                     self._count_file(task, ok=False)
                     return
 
@@ -722,6 +877,8 @@ class DownloadQueue:
                         task.state = 'error'
                         task.error = '%d 个文件失败: %s' % (
                             len(task._fails), ', '.join(str(x) for x in task._fails[:3]))
+                        if task._last_err:
+                            task.error += ' | ' + task._last_err
                     else:
                         task.state = 'done'
                     task.finished = time.time()
@@ -1014,6 +1171,92 @@ class BatchDLWindow(ctk.CTkToplevel):
         self.app.remove_task_listener(self._on_task_change)
         self.destroy()
 
+# ---------------- 连接设置窗口 ----------------
+class SettingsWindow(ctk.CTkToplevel):
+    """连接设置: 盒子地址 / 账号 / 密码 / 共享名 (默认 = 图谱盒子出厂值)。"""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title('连接设置')
+        self.resizable(False, False)
+        try:
+            self.transient(app)
+        except Exception:
+            pass
+        self.protocol('WM_DELETE_WINDOW', self.destroy)
+        self._build_ui()
+        w, h = 470, 372
+        try:
+            x = app.winfo_x() + max(0, (app.winfo_width() - w) // 2)
+            y = app.winfo_y() + max(0, (app.winfo_height() - h) // 3)
+            self.geometry(f'{w}x{h}+{x}+{y}')
+        except Exception:
+            self.geometry(f'{w}x{h}')
+
+    def _row(self, box, label, value, show=None, ph=''):
+        f = ctk.CTkFrame(box, fg_color='transparent')
+        f.pack(fill='x', padx=14, pady=(9, 0))
+        ctk.CTkLabel(f, text=label, width=76, anchor='w', font=FONT,
+                     text_color=C['dim']).pack(side='left')
+        e = ctk.CTkEntry(f, font=FONT, height=30, placeholder_text=ph)
+        if show:
+            e.configure(show=show)
+        e.pack(side='left', fill='x', expand=True)
+        if value:
+            e.insert(0, value)
+        return e
+
+    def _build_ui(self):
+        ctk.CTkLabel(self, text='连接设置', font=FONT_TITLE, text_color=C['text']).pack(pady=(16, 0))
+        ctk.CTkLabel(self, text='默认 = 图谱盒子出厂设置; 地址留空 = 每次自动发现',
+                     font=FONT_SMALL, text_color=C['dim']).pack(pady=(2, 4))
+        box = ctk.CTkFrame(self, fg_color=C['panel2'], corner_radius=12)
+        box.pack(fill='x', padx=18)
+        cur_host = '' if (not self.app.host or self.app.host == HOST) else self.app.host
+        self.e_host = self._row(box, '盒子地址', cur_host, ph='留空 = 自动发现 (网线直连 / 热点)')
+        self.e_user = self._row(box, '账号', CREDS['user'])
+        self.e_pass = self._row(box, '密码', CREDS['pass'], show='•')
+        self.e_share = self._row(box, '共享名', CREDS['share'])
+        ctk.CTkLabel(box, text='', height=4, font=FONT_SMALL).pack()
+        ctk.CTkLabel(self, text='提示: 直连时盒子地址是随机的 169.254.x.x, 一般留空即可; 设置会保存。',
+                     font=FONT_SMALL, text_color=C['faint']).pack(anchor='w', padx=24, pady=(8, 0))
+        btns = ctk.CTkFrame(self, fg_color='transparent')
+        btns.pack(fill='x', padx=18, pady=(12, 14), side='bottom')
+        ctk.CTkButton(btns, text='恢复默认', width=92, height=32, font=FONT,
+                      fg_color=C['panel3'], hover_color=C['panel2'], text_color=C['text'],
+                      command=self._reset_defaults).pack(side='left')
+        ctk.CTkButton(btns, text='保存', width=112, height=32, font=FONT,
+                      fg_color=C['accent'], hover_color=C['accent_h'],
+                      command=self._save).pack(side='right')
+        ctk.CTkButton(btns, text='取消', width=80, height=32, font=FONT,
+                      fg_color=C['panel3'], hover_color=C['panel2'], text_color=C['text'],
+                      command=self.destroy).pack(side='right', padx=(0, 8))
+
+    def _reset_defaults(self):
+        self.e_host.delete(0, 'end')
+        for e, v in ((self.e_user, USER), (self.e_pass, PASS), (self.e_share, SHARE)):
+            e.delete(0, 'end')
+            e.insert(0, v)
+
+    def _save(self):
+        host = self.e_host.get().strip()
+        user = self.e_user.get().strip()
+        pwd = self.e_pass.get()
+        share = self.e_share.get().strip()
+        if not user or not share:
+            messagebox.showwarning('提示', '账号和共享名不能为空', parent=self)
+            return
+        apply_settings(self.app.cfg, host=host, user=user, password=pwd, share=share)
+        self.app.host = host or HOST
+        self.app.svc.close()
+        self.app._dot_pulse(False)
+        self.app.dot.configure(text_color=C['faint'])
+        self.app.btn_conn.configure(text='重连')
+        self.app._st('设置已保存, 正在重新连接…', 'dim')
+        self.destroy()
+        self.app.connect_async()
+
 # ---------------- 主窗口 ----------------
 class BoxerApp(ctk.CTk):
     def __init__(self):
@@ -1022,6 +1265,7 @@ class BoxerApp(ctk.CTk):
         self.geometry('1140x740')
         self.minsize(980, 620)
         self.cfg = AppConfig()
+        _load_creds(self.cfg)
         g = self.cfg.get('geometry')
         if g:
             try:
@@ -1097,13 +1341,15 @@ class BoxerApp(ctk.CTk):
         self.btn_conn.pack(side='right', padx=(0, 14))
         self.btn_host = self._nbtn(head, '地址', 56, self.set_host_manual)
         self.btn_host.pack(side='right', padx=(0, 4))
+        self.btn_set = self._nbtn(head, '设置', 56, self.open_settings)
+        self.btn_set.pack(side='right', padx=(0, 4))
         self.dot = ctk.CTkLabel(head, text='●', font=('Segoe UI', 18), text_color=C['faint'])
         self.dot.pack(side='left', padx=(14, 6))
         ttl = ctk.CTkFrame(head, fg_color='transparent')
         ttl.pack(side='left')
         ctk.CTkLabel(ttl, text='AstroStation 天文盒子', font=FONT_TITLE,
                      text_color=C['text']).pack(anchor='w')
-        self.lbl_sub = ctk.CTkLabel(ttl, text=f'共享 {SHARE} · 账号 {USER} · 自动发现',
+        self.lbl_sub = ctk.CTkLabel(ttl, text=f'共享 {CREDS["share"]} · 账号 {CREDS["user"]} · 自动发现',
                                     font=FONT_SMALL, text_color=C['dim'])
         self.lbl_sub.pack(anchor='w')
         btns = ctk.CTkFrame(head, fg_color='transparent')
@@ -1164,7 +1410,7 @@ class BoxerApp(ctk.CTk):
         inf.pack(fill='x', padx=10, pady=10)
         ctk.CTkLabel(inf, text='连接信息', font=FONT_BOLD, text_color=C['dim']).pack(
             anchor='w', padx=12, pady=(8, 2))
-        self.lbl_conninfo = ctk.CTkLabel(inf, text=f'盒子  未连接\n账号  {USER}\n共享  {SHARE}',
+        self.lbl_conninfo = ctk.CTkLabel(inf, text=f'盒子  未连接\n账号  {CREDS["user"]}\n共享  {CREDS["share"]}',
                                          font=FONT_SMALL, text_color=C['text'], justify='left')
         self.lbl_conninfo.pack(anchor='w', padx=12, pady=(0, 8))
 
@@ -1350,8 +1596,8 @@ class BoxerApp(ctk.CTk):
         self.dot.configure(text_color=C['ok'])
         self.btn_conn.configure(text='断开')
         self._st(f'已连接 AstroStation ({self.host})', 'ok')
-        self.lbl_sub.configure(text=f'{self.host} · 共享 {SHARE} · 账号 {USER}')
-        self.lbl_conninfo.configure(text=f'盒子  {self.host}\n账号  {USER}\n共享  {SHARE}')
+        self.lbl_sub.configure(text=f'{self.host} · 共享 {CREDS["share"]} · 账号 {CREDS["user"]}')
+        self.lbl_conninfo.configure(text=f'盒子  {self.host}\n账号  {CREDS["user"]}\n共享  {CREDS["share"]}')
         self._update_nav_state()
         self.navigate('', record=False)
         self._load_tree_children('/')
@@ -1370,6 +1616,9 @@ class BoxerApp(ctk.CTk):
                              '也可点「地址」手动指定；需要的话把此消息发我排查。'
                              + (f'\n\n搜索记录:\n{logs}' if logs else ''),
                              parent=self)
+
+    def open_settings(self):
+        SettingsWindow(self)
 
     def set_host_manual(self):
         from tkinter import simpledialog
@@ -1396,8 +1645,8 @@ class BoxerApp(ctk.CTk):
             self.dot.configure(text_color=C['faint'])
             self.btn_conn.configure(text='重连')
             self._st('已断开连接', 'dim')
-            self.lbl_sub.configure(text=f'共享 {SHARE} · 账号 {USER} · 自动发现')
-            self.lbl_conninfo.configure(text=f'盒子  未连接\n账号  {USER}\n共享  {SHARE}')
+            self.lbl_sub.configure(text=f'共享 {CREDS["share"]} · 账号 {CREDS["user"]} · 自动发现')
+            self.lbl_conninfo.configure(text=f'盒子  未连接\n账号  {CREDS["user"]}\n共享  {CREDS["share"]}')
             self._update_nav_state()
             for k in self.side_tree.get_children('/'):
                 self.side_tree.delete(k)
@@ -1913,12 +2162,151 @@ def main():
 
 
 
+# ---------------- 命令行模式 (供自动化调用) ----------------
+def _cli(argv):
+    """命令行接口: discover / ls / stat / dl。
+    结果 JSON 打到 stdout(无 stdout 的打包环境用 --out 写文件), 进度打 stderr。
+    退出码: 0 成功 / 2 下载有失败 / 3 未发现盒子 / 4 参数或远程路径错误。"""
+    _load_creds(AppConfig())
+    import argparse
+
+    ap = argparse.ArgumentParser(prog='stellavita_browser.py --cli',
+                                 description='AstroStation 天文盒子: 发现/浏览/下载 (自动化调用)')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    sp = sub.add_parser('discover', help='发现盒子地址')
+    sp.add_argument('--host', default='')
+    sp.add_argument('--out', default='')
+
+    sp = sub.add_parser('ls', help='列出远程目录(JSON)')
+    sp.add_argument('remote', nargs='?', default='')
+    sp.add_argument('--host', default='')
+    sp.add_argument('--out', default='')
+
+    sp = sub.add_parser('stat', help='统计远程路径文件数/字节数')
+    sp.add_argument('remote', nargs='?', default='')
+    sp.add_argument('--host', default='')
+    sp.add_argument('--out', default='')
+
+    sp = sub.add_parser('dl', help='下载文件/文件夹(并行)')
+    sp.add_argument('remote')
+    sp.add_argument('local', help='目标: 文件夹=目标目录; 文件=文件路径或所在目录')
+    sp.add_argument('--jobs', type=int, default=PARALLEL_DEFAULT)
+    sp.add_argument('--host', default='')
+    sp.add_argument('--out', default='')
+
+    a = ap.parse_args(argv)
+
+    def finish(obj, code):
+        text = json.dumps(obj, ensure_ascii=False)
+        if getattr(sys, 'stdout', None):
+            print(text)
+        p = getattr(a, 'out', '')
+        if p:
+            try:
+                with open(p, 'w', encoding='utf-8') as f:
+                    f.write(text)
+            except Exception:
+                pass
+        return code
+
+    def resolve():
+        h = (getattr(a, 'host', '') or '').strip()
+        if h:
+            return h, []
+        logs = []
+        ip = discover_host(AppConfig(), log=logs.append)
+        return ip, logs
+
+    ip, logs = resolve()
+    if not ip:
+        return finish({'ok': False, 'error': '未发现盒子', 'logs': logs}, 3)
+
+    if a.cmd == 'discover':
+        return finish({'ok': True, 'host': ip, 'logs': logs}, 0)
+
+    if a.cmd == 'ls':
+        try:
+            svc = SMBService(host=ip)
+            svc.connect()
+            items = [{'name': e.name, 'dir': e.is_dir, 'size': e.size, 'mtime': e.mtime}
+                     for e in svc.list_dir(norm_path(a.remote))]
+            svc.close()
+        except Exception as e:
+            return finish({'ok': False, 'host': ip, 'error': _short(e, 200)}, 4)
+        return finish({'ok': True, 'host': ip, 'path': norm_path(a.remote), 'items': items}, 0)
+
+    if a.cmd == 'stat':
+        try:
+            svc = SMBService(host=ip)
+            svc.connect()
+            n, b = svc.count_tree(norm_path(a.remote))
+            svc.close()
+        except Exception as e:
+            return finish({'ok': False, 'host': ip, 'error': _short(e, 200)}, 4)
+        return finish({'ok': True, 'host': ip, 'path': norm_path(a.remote), 'files': n, 'bytes': b}, 0)
+
+    # dl
+    remote = norm_path(a.remote)
+    try:
+        svc = SMBService(host=ip)
+        svc.connect()
+        entry = next((e for e in svc.list_dir(parent_path(remote))
+                      if e.name == basename_path(remote)), None)
+        svc.close()
+    except Exception as e:
+        return finish({'ok': False, 'host': ip, 'error': _short(e, 200)}, 4)
+    if entry is None:
+        return finish({'ok': False, 'host': ip, 'error': '远程不存在: %s' % remote}, 4)
+
+    local = os.path.abspath(a.local)
+    rename_to = ''
+    q = DownloadQueue(on_change=None, host_getter=lambda: ip)
+    q.set_parallel(max(1, min(16, a.jobs)))
+    if entry.is_dir:
+        task = q.submit(remote, local, kind='batch', title=entry.name)   # 目录内容直接进 local
+    else:
+        if os.path.isdir(local) or a.local.endswith(('/', '\\')):
+            dst_dir = local
+        else:
+            dst_dir = os.path.dirname(local) or '.'
+            if os.path.basename(local) != entry.name:
+                rename_to = local
+        task = q.submit(remote, dst_dir, kind='file', size_hint=entry.size, title=entry.name)
+
+    t0 = time.time()
+    last_n = -1
+    while not task.terminal:
+        time.sleep(0.3)
+        if task.files_done != last_n:
+            last_n = task.files_done
+            if getattr(sys, 'stderr', None):
+                print('  [%s/%s] %s' % (task.files_done, task.files_total or '?',
+                                        size_str(task.bytes_done)), file=sys.stderr)
+    q.shutdown()
+    ok = (task.state == 'done')
+    if ok and rename_to:
+        try:
+            os.replace(os.path.join(dst_dir, entry.name), rename_to)
+        except Exception:
+            ok = False
+    res = {'ok': ok, 'host': ip, 'remote': remote, 'local': rename_to or local,
+           'state': task.state, 'files': task.files_done, 'files_total': task.files_total,
+           'bytes': task.bytes_done, 'seconds': round(time.time() - t0, 1)}
+    if not ok:
+        res['error'] = task.error or '下载失败'
+    return finish(res, 0 if ok else 2)
+
+
 def _selftest():
     """无头自检: 搜索盒子并列出根目录 (打包后验证/排障用)。"""
     import sys as _s
+    _load_creds(AppConfig())
     logs = []
     ip = discover_host(None, log=logs.append)
-    out = ['discover -> %s' % ip] + ['  ' + l for l in logs]
+    out = ['StellaVitaBrowser %s' % VERSION,
+           'config -> %s' % CONFIG_PATH,
+           'discover -> %s' % ip] + ['  ' + l for l in logs]
     ok = False
     if ip:
         try:
@@ -1941,7 +2329,8 @@ def _selftest():
     return ok
 
 if __name__ == '__main__':
-    import sys as _sys
-    if '--selftest' in _sys.argv:
-        _sys.exit(0 if _selftest() else 2)
+    if '--selftest' in sys.argv:
+        sys.exit(0 if _selftest() else 2)
+    if '--cli' in sys.argv:
+        sys.exit(_cli(sys.argv[sys.argv.index('--cli') + 1:]))
     main()
